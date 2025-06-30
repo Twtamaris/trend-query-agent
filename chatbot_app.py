@@ -1,9 +1,9 @@
 import os
 from google.cloud import bigquery
 import pandas as pd
-import numpy as np # For handling numpy arrays
+import numpy as np
 from datetime import datetime, timedelta
-import json # For parsing LLM output
+import json
 import re # For regex parsing in LLM output
 
 # LangChain components for GROQ and prompting
@@ -11,7 +11,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_groq import ChatGroq
 from sentence_transformers import SentenceTransformer
-from scipy.spatial.distance import cosine # For calculating cosine similarity
+from scipy.spatial.distance import cosine
 from dotenv import load_dotenv
 
 # --- GraphRAG Specific Imports (Conceptual) ---
@@ -55,6 +55,10 @@ def get_conversation_data_with_embeddings(zip_code=None, start_date=None, end_da
     Dates should be in 'YYYY-MM-DD' format.
     Queries the 'conversations_with_embeddings' table.
     """
+    # Use the project ID from the BigQuery client directly if it's initialized with one,
+    # or ensure it's provided here (e.g., from an environment variable or config).
+    # For now, let's keep it hardcoded as in your original example, but good practice
+    # is to retrieve it dynamically or from a config file.
     project_id = "chatbot-project-464108" # Replace with your actual project ID
     dataset_id = "customer_service_data" # Replace with your actual dataset ID
     table_name = "conversations_with_embeddings" # Using the table created in Step 4
@@ -89,11 +93,9 @@ def get_conversation_data_with_embeddings(zip_code=None, start_date=None, end_da
     query_job = client.query(query)
     results = query_job.result()
     
-    # Convert BigQuery Row objects to dictionaries and ensure embedding is a list of floats
     processed_results = []
     for row in results:
         row_dict = dict(row)
-        # BigQuery returns ARRAY<FLOAT64> as a tuple of floats, convert to list
         if 'embedding' in row_dict and isinstance(row_dict['embedding'], (tuple, list)):
             row_dict['embedding'] = list(row_dict['embedding'])
         processed_results.append(row_dict)
@@ -121,7 +123,6 @@ def summarize_conversations_with_llm(conversations):
             "overall_sentiment": "N/A"
         }
 
-    # Limit the number of conversations to send to the LLM to manage context window and cost
     conversations_for_llm = "\n---\n".join(all_texts[:5]) 
 
     prompt_template = ChatPromptTemplate.from_messages(
@@ -151,9 +152,6 @@ def summarize_conversations_with_llm(conversations):
 
     try:
         llm_response = llm_chain.invoke({"conversations": conversations_for_llm})
-        # print(f"\nLLM Raw Response:\n{llm_response}") # For debugging LLM output
-
-        # Attempt to parse the JSON response
         json_match = re.search(r'\{(.*?)\}', llm_response, re.DOTALL)
 
         if json_match:
@@ -170,8 +168,7 @@ def summarize_conversations_with_llm(conversations):
         }
 
     except Exception as e:
-        print(f"Error during LLM call or parsing: {e}")
-        # Fallback to basic summary if LLM fails
+        print(f"Error during LLM call or parsing summarization: {e}")
         fallback_summary_text = f"LLM summarization failed. Found {len(conversations)} conversations.\n"
         fallback_issues = {}
         fallback_sentiments = {'positive': 0, 'negative': 0, 'neutral': 0}
@@ -192,9 +189,8 @@ def answer_user_query_hybrid(user_query, zip_code=None, days_back=None, sentimen
     """
     Answers a user query using a hybrid approach: BigQuery filtering + vector search.
     """
-    print(f"\n--- Processing User Query: '{user_query}' ---")
+    print(f"\n--- Processing User Query: '{user_query}' with Customer Conversation Agent ---")
 
-    # 1. Extract Structured Filters (basic parsing, extend for more complexity)
     start_date_str = None
     end_date_str = None
     if days_back:
@@ -203,14 +199,7 @@ def answer_user_query_hybrid(user_query, zip_code=None, days_back=None, sentimen
         start_date_str = start_date.strftime('%Y-%m-%d')
         end_date_str = today.strftime('%Y-%m-%d')
     
-    # NOTE: For real-world use, you would use an NLU model (or another LLM call)
-    # to extract `zip_code`, `days_back`, `sentiment`, `issue_category`
-    # directly from the `user_query` if they are not provided as separate arguments.
-    # For this example, we assume these are either provided or manually extracted.
-
-
-    # 2. BigQuery Filtering (get relevant conversations with their embeddings)
-    print("Step 2: Filtering conversations using BigQuery (and retrieving embeddings)...")
+    print("Step 1: Filtering conversations using BigQuery (and retrieving embeddings)...")
     bq_filtered_conversations = get_conversation_data_with_embeddings(
         zip_code=zip_code,
         start_date=start_date_str,
@@ -222,8 +211,6 @@ def answer_user_query_hybrid(user_query, zip_code=None, days_back=None, sentimen
     if not bq_filtered_conversations:
         return "No relevant conversations found based on your specified structured criteria."
 
-    # Separate conversation texts and their embeddings for similarity search
-    # Ensure all conversations have an embedding and conversation_text
     conversations_with_embeddings = [
         conv for conv in bq_filtered_conversations 
         if conv.get('embedding') is not None and conv.get('conversation_text') is not None
@@ -232,28 +219,24 @@ def answer_user_query_hybrid(user_query, zip_code=None, days_back=None, sentimen
     if not conversations_with_embeddings:
         return "No conversations with valid embeddings found after filtering."
         
-    filtered_texts = [conv['conversation_text'] for conv in conversations_with_embeddings]
     filtered_embeddings = np.array([conv['embedding'] for conv in conversations_with_embeddings])
     
     print(f" → Found {len(filtered_embeddings)} conversations after BigQuery filtering.")
 
 
-    # 3. Generate Query Embedding
-    print("Step 3: Generating embedding for the user query...")
+    print("Step 2: Generating embedding for the user query...")
     query_embedding = embedding_model.encode([user_query], normalize_embeddings=True)[0]
     print(" → Query embedding generated.")
 
-    # 4. Vector Similarity Search on Filtered Embeddings
-    print("Step 4: Performing vector similarity search on filtered results...")
+    print("Step 3: Performing vector similarity search on filtered results...")
     similarities = []
     for conv_emb in filtered_embeddings:
         try:
             similarities.append(1 - cosine(query_embedding, conv_emb))
         except ValueError as e:
             similarities.append(-1.0) # Assign a low similarity score
-            # print(f"Warning: Could not calculate similarity for an embedding: {e}") # Debug if needed
 
-    top_n = 5 # Get the top N most similar conversations
+    top_n = 5
     top_indices = np.argsort(similarities)[::-1][:top_n]
 
     valid_top_indices = [idx for idx in top_indices if 0 <= idx < len(conversations_with_embeddings)]
@@ -261,7 +244,7 @@ def answer_user_query_hybrid(user_query, zip_code=None, days_back=None, sentimen
 
     top_similar_conversations_data = [
         conv for conv, sim_score in zip(top_similar_conversations_data, [similarities[idx] for idx in valid_top_indices])
-        if sim_score != -1.0 # Filter out problematic similarities
+        if sim_score != -1.0
     ]
 
     if not top_similar_conversations_data:
@@ -269,8 +252,7 @@ def answer_user_query_hybrid(user_query, zip_code=None, days_back=None, sentimen
 
     print(f" → Found {len(top_similar_conversations_data)} top similar conversations.")
 
-    # 5. LLM for Synthesis
-    print("Step 5: Synthesizing answer using LLM...")
+    print("Step 4: Synthesizing answer using LLM...")
     llm_summary_output = summarize_conversations_with_llm(top_similar_conversations_data)
 
     final_answer = f"Based on your query and relevant conversations:\n\n"
@@ -282,15 +264,12 @@ def answer_user_query_hybrid(user_query, zip_code=None, days_back=None, sentimen
 
 # --- GraphRAG Integration: Step 6 ---
 
-# Conceptual setup for GraphRAG document folder:
-# You would place your brand-specific documents (e.g., 'brand_overview.txt', 'product_strategy.md')
-# into this directory.
 BRAND_DOCUMENTS_DIR = "data/brand_documents"
 
 if not os.path.exists(BRAND_DOCUMENTS_DIR):
     os.makedirs(BRAND_DOCUMENTS_DIR)
     print(f"Created directory: '{BRAND_DOCUMENTS_DIR}'. Please place your brand documents here for GraphRAG.")
-    # You might want to create some dummy files for initial testing
+    # Create dummy files for initial testing
     with open(os.path.join(BRAND_DOCUMENTS_DIR, "brand_overview.txt"), "w") as f:
         f.write("InnovateTech is a leading AI solutions provider. Our core mission is to democratize AI. Our flagship product, 'AI-Assistant Pro', focuses on natural language understanding and automated customer support. A significant trend is the push for explainable AI. We aim to integrate more deeply with enterprise CRM systems.")
     with open(os.path.join(BRAND_DOCUMENTS_DIR, "product_roadmap.txt"), "w") as f:
@@ -298,30 +277,15 @@ if not os.path.exists(BRAND_DOCUMENTS_DIR):
     print("Created dummy brand documents for demonstration purposes.")
 
 
-# --- GraphRAG Querying Function (Simulated) ---
-# In a full GraphRAG integration, this function would:
-# 1. Use GraphRAG's configuration to load the pre-built graph.
-# 2. Use GraphRAG's internal query interface to retrieve relevant nodes/edges/subgraphs
-#    based on the user's query (often involving embeddings and graph algorithms).
-# 3. Format the retrieved graph information into a concise text context for the LLM.
-
 def query_knowledge_graph_agent(user_query: str) -> str:
     """
     Simulates querying a GraphRAG-built knowledge graph for nuanced brand information,
     trends, product features, and competitive analysis.
     This function acts as the "Topic Agent" or "Trend Agent."
     """
-    print(f"\n--- Querying Knowledge Graph Agent for: '{user_query}' ---")
+    print(f"\n--- Processing User Query: '{user_query}' with Knowledge Graph Agent ---")
 
     # --- SIMULATED GRAPH RETRIEVAL ---
-    # In a real GraphRAG setup, this would be the result of a complex process:
-    # 1. GraphRAG pipeline running on documents to create entities, relationships.
-    # 2. Query embedding: user_query -> embedding.
-    # 3. Graph traversal/search: Use the query embedding to find relevant nodes/edges in the graph.
-    # 4. Context assembly: Extract relevant facts/text snippets from those graph components.
-    
-    # For this demonstration, we'll use a very basic keyword-driven simulation
-    # to provide 'context' that an actual GraphRAG retrieval would yield.
     retrieved_graph_context = ""
     query_lower = user_query.lower()
 
@@ -350,7 +314,6 @@ def query_knowledge_graph_agent(user_query: str) -> str:
             "but AI-Assistant Pro offers superior scalability."
         )
     else:
-        # Default, general info if no specific keyword matches.
         retrieved_graph_context = (
             "The brand is InnovateTech, a leading AI solutions provider whose mission is to democratize AI. "
             "Its flagship product is AI-Assistant Pro, focusing on natural language understanding and automated customer support. "
@@ -364,9 +327,6 @@ def query_knowledge_graph_agent(user_query: str) -> str:
 
     print(f" → Simulated GraphRAG Context Provided to LLM:\n{retrieved_graph_context[:300]}...")
 
-    # --- LLM for Nuanced Answer Generation ---
-    # The LLM takes the user's query and the context retrieved from the graph.
-    # It synthesizes the information to answer nuanced questions.
     prompt_template = ChatPromptTemplate.from_messages(
         [
             (
@@ -392,103 +352,180 @@ def query_knowledge_graph_agent(user_query: str) -> str:
         print(f"Error during LLM call for knowledge graph query: {e}")
         return "Sorry, I could not synthesize an answer from the knowledge graph at this time."
 
-# --- Main Chatbot Orchestration (Intent Classification) ---
-# This function routes the user's query to the appropriate agent (BigQuery or GraphRAG).
-# For a production system, this intent classification would be more robust,
-# perhaps using a dedicated LLM call or a sophisticated NLU model.
+# --- Intent Classification LLM Setup ---
+# This LLM will analyze the user's query and decide the intent and extract parameters.
+intent_classification_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are a helpful assistant for routing user queries.
+            Your task is to analyze the user's query and determine their intent.
+            You should output a JSON object with two main keys:
+            - 'intent': This should be one of 'customer_conversation', 'brand_knowledge', or 'unclear'.
+            - 'parameters': This should be a JSON object containing any relevant extracted parameters.
 
-def chatbot_main_agent(user_query: str, **kwargs) -> str:
+            For 'customer_conversation' intent, extract the following parameters if present:
+            - 'zip_code': (string, e.g., "90210")
+            - 'days_back': (integer, e.g., 7 for 'last 7 days')
+            - 'sentiment': (string, e.g., "positive", "negative", "neutral")
+            - 'issue_category': (string, e.g., "billing", "internet speed", "service outage")
+
+            For 'brand_knowledge' intent, no specific parameters are required, but you can extract general topics if they are clear.
+
+            Example Outputs:
+            1. User: "Summarize conversations for the last 7 days in zip code 12345 with negative sentiment."
+               {{
+                 "intent": "customer_conversation",
+                 "parameters": {{
+                   "zip_code": "12345",
+                   "days_back": 7,
+                   "sentiment": "negative"
+                 }}
+               }}
+            2. User: "What are the top trends for InnovateTech?"
+               {{
+                 "intent": "brand_knowledge",
+                 "parameters": {{}}
+               }}
+            3. User: "Tell me about their new AI features."
+               {{
+                 "intent": "brand_knowledge",
+                 "parameters": {{}}
+               }}
+            4. User: "How are customers feeling about internet speed issues in 90210?"
+               {{
+                 "intent": "customer_conversation",
+                 "parameters": {{
+                   "zip_code": "90210",
+                   "issue_category": "internet speed"
+                 }}
+               }}
+            5. User: "Hello, how are you?"
+               {{
+                 "intent": "unclear",
+                 "parameters": {{}}
+               }}
+            
+            YOUR ENTIRE RESPONSE MUST BE ONLY THE JSON OBJECT, NOTHING ELSE. DO NOT INCLUDE ANY INTRODUCTORY OR CONCLUDING REMARKS, OR MARKDOWN BACKTICKS (```json).
+            """
+        ),
+        ("human", "User query: {user_query}"),
+    ]
+)
+
+intent_classification_chain = intent_classification_prompt | llm | StrOutputParser()
+
+
+def chatbot_main_agent(user_query: str) -> str:
     """
-    The main entry point for the chatbot. It determines the user's intent
+    The main entry point for the chatbot. It uses an LLM to determine the user's intent
     and routes the query to either the Customer Conversation Agent (BigQuery+Vector)
     or the Knowledge Graph (Brand/Trend) Agent.
     """
-    query_lower = user_query.lower()
+    print(f"\n--- Chatbot Main Agent Processing Query: '{user_query}' ---")
 
-    # Keywords for routing to the Knowledge Graph Agent
-    graph_keywords = ["trend", "trends", "emerging", "future", "roadmap", "brand", "innovatetech",
-                      "product", "features", "ai-assistant pro", "competitor", "compare", "global ai solutions",
-                      "mission", "strategy", "vision"]
+    try:
+        # Step 1: Use LLM for Intent Classification and Parameter Extraction
+        print("Step 1: Classifying intent and extracting parameters using LLM...")
+        llm_routing_response = intent_classification_chain.invoke({"user_query": user_query})
+        
+        print("-------------------------------")
+        print("-------------------------------")
+        print("-------------------------------")
+        print("-------------------------------")
+        print("-------------------------------")
+        print(llm_routing_response)
+        print("-------------------------------")
+        print("-------------------------------")
+        print("-------------------------------")
+        print("-------------------------------")
+        print("-------------------------------")
+        
+        
+        # # Robustly parse the JSON output from the LLM
+        # json_match = re.search(r'\{(.*?)\}', llm_routing_response, re.DOTALL)
+        # if json_match:
+        #     json_string = "{" + json_match.group(1) + "}"
+        # else:
+        #     print(f"Warning: LLM did not return valid JSON for intent classification. Raw: {llm_routing_response}")
+        #     # Fallback for parsing issues: assume unclear intent
+        #     parsed_routing = {"intent": "unclear", "parameters": {}}
+        
+        # Remove this(hehe)(not now)
+        json_string = llm_routing_response
 
-    # Keywords for routing to the Customer Conversation Agent
-    bigquery_keywords = ["summarize", "conversations", "issues", "sentiment", "problems",
-                         "zip code", "area", "geography", "customer service", "complaints"]
-
-    # Simple heuristic-based routing
-    if any(keyword in query_lower for keyword in graph_keywords) and \
-       not any(keyword in query_lower for keyword in bigquery_keywords): # Prioritize graph if relevant and not strong BQ
-        print("\n--- Routing query to Knowledge Graph (Brand/Trend) Agent ---")
-        return query_knowledge_graph_agent(user_query)
-    elif any(keyword in query_lower for keyword in bigquery_keywords):
-        print("\n--- Routing query to Customer Conversation (BigQuery + Vector) Agent ---")
-        # Pass relevant kwargs if available
-        return answer_user_query_hybrid(
-            user_query,
-            zip_code=kwargs.get('zip_code'),
-            days_back=kwargs.get('days_back'),
-            sentiment=kwargs.get('sentiment'),
-            issue_category=kwargs.get('issue_category')
-        )
-    else:
-        # If no clear intent, you might default to one or ask for clarification.
-        # For now, we'll try the hybrid search as it's more general for "data."
-        print("\n--- No clear intent detected, defaulting to Customer Conversation Agent ---")
-        return answer_user_query_hybrid(
-            user_query,
-            zip_code=kwargs.get('zip_code'),
-            days_back=kwargs.get('days_back'),
-            sentiment=kwargs.get('sentiment'),
-            issue_category=kwargs.get('issue_category')
-        )
+        try:
+            parsed_routing = json.loads(json_string)
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON from LLM intent: {e}. Raw: {json_string}")
+            # Fallback for JSON parsing error
+            parsed_routing = {"intent": "unclear", "parameters": {}}
 
 
-# --- Main execution flow for Step 6 ---
+        intent = parsed_routing.get("intent", "unclear")
+        params = parsed_routing.get("parameters", {})
+
+        print(f" → Detected Intent: '{intent}', Parameters: {params}")
+
+        # Step 2: Route based on detected intent
+        if intent == "customer_conversation":
+            print("--- Routing to Customer Conversation Agent ---")
+            return answer_user_query_hybrid(user_query, **params)
+        elif intent == "brand_knowledge":
+            print("--- Routing to Knowledge Graph (Brand/Trend) Agent ---")
+            return query_knowledge_graph_agent(user_query)
+        else:
+            print("--- Intent unclear, providing a general response ---")
+            return "I'm sorry, I couldn't understand your request clearly. Could you please rephrase it or ask about customer conversations (e.g., summary, issues, sentiment, zip code) or about InnovateTech's brand, products, or trends?"
+
+    except Exception as e:
+        print(f"An error occurred during intent classification: {e}")
+        return "I apologize, but I encountered an internal error. Please try again later."
+
+
+# --- Main execution flow ---
 if __name__ == "__main__":
     print("--- Starting Chatbot Main Agent Demonstrations ---")
 
-    # --- Test GraphRAG Agent Queries ---
+    # --- Test GraphRAG Agent Queries (routed by LLM) ---
     print("\n--- Testing Knowledge Graph (Brand/Trend) Agent ---")
     
-    # Query 1: Top trends
     query_graph_1 = "What are the top emerging trends for InnovateTech in the AI space?"
     print(chatbot_main_agent(query_graph_1))
 
-    # Query 2: Product features
     query_graph_2 = "Can you describe the key features of AI-Assistant Pro and its future roadmap?"
     print(chatbot_main_agent(query_graph_2))
 
-    # Query 3: Competitors
     query_graph_3 = "How does InnovateTech's product compare to Global AI Solutions?"
     print(chatbot_main_agent(query_graph_3))
 
-    # Query 4: Brand mission
     query_graph_4 = "What is InnovateTech's core mission and vision?"
     print(chatbot_main_agent(query_graph_4))
 
-    # Query 5: Nuanced query for trends that might not have explicit keywords
     query_graph_5 = "Are there any new directions in AI solutions that InnovateTech is considering?"
     print(chatbot_main_agent(query_graph_5))
 
-    # --- Test BigQuery + Vector Search Agent Queries ---
-    # These will only work if your BigQuery table 'conversations_with_embeddings'
-    # is populated with data (as per your Step 4 and 5 setup).
-    print("\n--- Testing Customer Conversation (BigQuery + Vector) Agent (Requires BigQuery Data) ---")
+    # --- Test BigQuery + Vector Search Agent Queries (routed by LLM) ---
+    print("\n--- Testing Customer Conversation (BigQuery + Vector) Agent ---")
 
-    # Example: User asks about general issues in a specific zip code recently
     # IMPORTANT: Replace with a zip code that exists in your BigQuery data for testing.
-    # Also, ensure your BigQuery table has conversations within the last 10 days for this zip.
-    user_query_bigquery_1 = "What are the common problems customers faced recently in zip code 92122?"
-    print(chatbot_main_agent(user_query_bigquery_1, zip_code='92122', days_back=10))
+    # Ensure your BigQuery table has conversations within the specified days for these zip codes.
+    user_query_bigquery_1 = "Summarize conversations for the last 10 days in zip code 92122."
+    print(chatbot_main_agent(user_query_bigquery_1))
 
-    # Example: User asks about negative sentiment related to billing issues
-    # IMPORTANT: Replace with a zip code, sentiment, and issue_category that exist in your BigQuery data.
-    user_query_bigquery_2 = "Tell me about negative experiences related to internet connectivity issues in my area (92122)."
-    print(chatbot_main_agent(user_query_bigquery_2, zip_code='92122', sentiment='Negative', issue_category='internet_connectivity', days_back=30))
+    user_query_bigquery_2 = "How are customers feeling about internet connectivity issues in 92122 over the past 2 weeks?"
+    print(chatbot_main_agent(user_query_bigquery_2)) # LLM should extract zip, issue, days_back
 
-    # Example: A general query that will default to BigQuery agent, limiting by date for performance
-    user_query_bigquery_3 = "Summarize conversations about account management."
-    print(chatbot_main_agent(user_query_bigquery_3, days_back=7, issue_category='account management'))
+    user_query_bigquery_3 = "Show me negative sentiment issues from last month."
+    # This query doesn't specify zip code, so it will search broadly, then filter by sentiment.
+    print(chatbot_main_agent(user_query_bigquery_3)) # LLM should extract sentiment, and interpret "last month" for days_back
 
+    # --- Test Unclear / Default Queries ---
+    print("\n--- Testing Unclear / Default Handling ---")
+    query_unclear_1 = "Hello chatbot, how are you today?"
+    print(chatbot_main_agent(query_unclear_1))
 
-    print("\n--- Step 6 (GraphRAG Integration) Conceptual Code Demonstration Completed ---")
-    print("\nNext Steps: Real GraphRAG setup, more robust intent classification, and potentially a user interface.")
+    query_unclear_2 = "Tell me a joke."
+    print(chatbot_main_agent(query_unclear_2))
+
+    print("\n--- Chatbot Main Agent Demonstration Completed ---")
