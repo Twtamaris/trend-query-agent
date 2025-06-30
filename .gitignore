@@ -1,3 +1,4 @@
 myenv
 .env
 ragtest_project
+data/.env
