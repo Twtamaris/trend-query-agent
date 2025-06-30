@@ -1,0 +1,104 @@
+# settings.yaml for GraphRAG, configured for Groq (OpenAI-compatible API)
+
+# --- General Pipeline Settings ---
+pipeline_defaults:
+  # Adjust these based on your data size and desired performance
+  chunk_size: 1500
+  chunk_overlap: 100
+  # For smaller datasets, consider 'skip_community_detection: true' for faster runs
+  # skip_community_detection: false
+
+# --- Data Source Configuration ---
+data:
+  source:
+    type: 'fsspec' # File system source, typically reads from 'input' directory
+    base_dir: 'input' # Relative to the root directory (e.g., ./ragtest_project/input)
+    file_patterns:
+      - '*.txt' # Process all .txt files in the input directory
+
+# --- LLM (Large Language Model) Configuration ---
+llm:
+  api_key: '${GRAPHRAG_API_KEY}' # GraphRAG picks this from the .env file
+  type: 'openai_chat' # Use 'openai_chat' as Groq provides an OpenAI-compatible API
+  api_base: 'https://api.groq.com/openai/v1' # Groq's OpenAI-compatible API endpoint
+  model: 'llama3-8b-8192' # Your preferred Groq model (e.g., llama3-8b-8192, mixtral-8x7b-32768)
+  temperature: 0.0 # Lower temperature for more consistent, factual responses
+  max_tokens: 8192 # Max context window for the model
+  model_supports_json: true # Important for GraphRAG's structured output
+  # Other optional settings:
+  # concurrent_requests: 10 # Adjust based on Groq's rate limits
+  # timeout: 60
+
+# --- Embedding Model Configuration ---
+embeddings:
+  llm:
+    api_key: '${GRAPHRAG_API_KEY}' # Re-use the same API key if Groq provides embedding API
+    type: 'openai_embedding' # Use 'openai_embedding' if Groq has an OpenAI-compatible embedding model
+    api_base: 'https://api.groq.com/openai/v1' # **IMPORTANT:** This assumes Groq also offers an OpenAI-compatible *embedding* endpoint at this base URL with the specified model.
+                                               # As of my last update, Groq is primarily for chat/completion,
+                                               # so you might need to change this if they don't support it,
+                                               # or if you use a different embedding model like SentenceTransformer.
+    model: 'nomic-embed-text' # **Highly Unlikely Groq supports this directly.** If you use Groq, choose a model THEY support for embeddings, or use a different embedding provider.
+                              # If you need a local SentenceTransformer, GraphRAG might require a different 'type' (e.g., 'sentence_transformer' if available) or
+                              # you'd run a local server (e.g., with Ollama, lm-studio) that exposes this model via an OpenAI-compatible embedding API.
+    token_limit: 8192 # Typical token limit for embedding models
+    # Other optional settings:
+    # concurrent_requests: 10
+
+  # Settings for how embeddings are generated and stored
+  vector_store_type: 'memory' # For in-memory processing. Can be 'chroma' or 'qdrant' for persistent stores.
+  text_embedder: # Settings for how text chunks are embedded
+    chunk_size: 512
+    # text_chunker_type: 'default' # default or semantic
+    # text_chunker_model: 'sentence-transformers/all-MiniLM-L6-v2' # Only if using semantic chunking
+
+# --- Entity Extraction Settings ---
+# Configures how entities are identified from text
+entity_extraction:
+  llm:
+    type: 'openai_chat' # Uses the LLM defined above
+    model: 'llama3-8b-8192' # Can specify a different model if needed, but defaults to global llm.model
+  # Other settings:
+  # extraction_prompt_type: 'default' # default or json_extraction
+  # entity_types: ['Person', 'Organization', 'Location'] # Customize entity types to extract
+  # json_mode: true # Often recommended for better parsing
+
+# --- Relationship Extraction Settings ---
+# Configures how relationships between entities are identified
+relationship_extraction:
+  llm:
+    type: 'openai_chat' # Uses the LLM defined above
+    model: 'llama3-8b-8192'
+  # Other settings:
+  # extraction_prompt_type: 'default' # default or json_extraction
+  # relationship_types: ['related_to', 'part_of'] # Customize relationship types to extract
+  # json_mode: true
+
+# --- Graph Building Settings ---
+# Configures how the graph is constructed from extracted entities and relationships
+graph:
+  # node_types: ['default']
+  # edge_types: ['default']
+  # communities_algorithm: 'leiden' # or 'louvain'
+  # community_detection_min_cluster_size: 5
+  # community_detection_node_threshold: 0.7 # Adjust for stricter/looser clustering
+
+# --- Community Report Generation Settings ---
+# Configures how summaries for detected communities are generated
+community_report_generation:
+  llm:
+    type: 'openai_chat' # Uses the LLM defined above
+    model: 'llama3-8b-8192'
+  # Other settings:
+  # report_prompt_type: 'default' # default or summarizing
+
+# --- Query Engine Settings (for later use with `graphrag query`) ---
+query_engine:
+  llm:
+    type: 'openai_chat'
+    model: 'llama3-8b-8192'
+  # Other settings:
+  # global_search_method: 'csearch' # or 'text_search'
+  # local_search_method: 'csearch' # or 'text_search'
+  # enable_community_context: true
+  # enable_entity_context: true

@@ -1,0 +1,57 @@
+# rag_config.yml
+llm:
+  # Using 'openai' provider but pointing to Groq's API base URL
+  # GraphRAG will expect OPENAI_API_KEY environment variable.
+  # So, set OPENAI_API_KEY = GROQ_API_KEY in your .env
+  # and OPENAI_API_BASE = https://api.groq.com/openai/v1
+  provider_name: openai
+  model_name: llama3-8b-8192 # Or another model available on Groq
+  api_base: https://api.groq.com/openai/v1
+  temperature: 0.0
+  max_retries: 5
+
+embeddings:
+  # Using 'openai' provider for embeddings as well, if Groq supports it
+  # or you might switch to a different embedding provider.
+  # For text-embedding-ada-002, the dimension is 1536.
+  # Since you're using Sentence Transformers locally, GraphRAG can be configured to use local models
+  # or you might need a separate embedding provider for GraphRAG if it's external.
+  # Let's configure GraphRAG to use a local sentence-transformer model for consistency with your previous steps.
+  provider_name: sentence_transformer
+  model_name: all-MiniLM-L6-v2 # Must match the model you used in Step 4
+  embedding_vector_store: text_cache # Use a cache for embeddings if running multiple times
+  # If you wanted to use an external embedding API:
+  # provider_name: openai
+  # model_name: text-embedding-ada-002 # or similar
+  # api_base: https://api.groq.com/openai/v1 # If Groq provides embedding API compatible with OpenAI
+  # token_limit: 8192 # Example
+
+# Data source configuration
+data:
+  source:
+    type: text
+    base_dir: data # Points to your 'data' folder
+    file_patterns: ["*.txt"] # Process all .txt files in the data folder
+
+# Community Report Generation (optional but powerful for summarization)
+reporting:
+  type: community
+  # parameters: # Optional parameters for report generation
+
+# Input data schema for processing
+input_data:
+  encoding: utf-8
+  document_column: text # The column where the document content is (for 'text' type, it's 'text')
+  title_column: title # Optional: a column for document titles
+  # id_column: id # Optional: a unique ID for each document
+
+# Global configuration settings
+globals:
+  # concurrency: 5 # Number of concurrent operations, adjust based on your machine/API limits
+  # For GraphRAG often set to the project root
+  # Default is often the current working directory where the script is run
+  # output_base_dir: ./output
+  # debug_mode: true
+
+
+

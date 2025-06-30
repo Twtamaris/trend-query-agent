@@ -1,0 +1,6 @@
+conversation_id,customer_id,agent_id,timestamp,zip_code,conversation_text,sentiment,issue_category
+1001,CUST001,AGENT01,"2025-06-20 10:05:00",90210,"Customer: My internet is super slow. Agent: Have you tried restarting your router? Customer: Yes, multiple times.",Negative,Technical Issue
+1002,CUST002,AGENT02,"2025-06-20 11:30:00",90210,"Customer: I want to upgrade my plan. Agent: Sure, let me check the available options for you.",Positive,Billing Inquiry
+1003,CUST003,AGENT01,"2025-06-21 09:15:00",10001,"Customer: My bill is incorrect. Agent: I apologize for the error, let me fix that for you.",Negative,Billing Dispute
+1004,CUST004,AGENT03,"2025-06-21 14:00:00",90210,"Customer: My TV service is out. Agent: We are aware of an outage in your area. Estimated fix time is 2 hours.",Negative,Service Outage
+1005,CUST005,AGENT02,"2025-06-22 08:45:00",10001,"Customer: Thank you for your help, everything is working great now!",Positive,Service Resolution
