@@ -5,11 +5,11 @@ import faiss
 from datetime import datetime, timedelta
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from models import LLM, EMBEDDING_MODEL
+from models import GROQ_LLM, OPENAI_LLM, EMBEDDING_MODEL # Import both LLMs
 from bq_utils import get_conversation_data
 from config import BRAND_DOCUMENTS_DIR
+from graphrag_utils import query_graphrag # Import the GraphRAG utility
 
-# --- LLM-Powered Summarization Function ---
 # --- LLM-Powered Summarization Function ---
 def summarize_conversations_with_llm(conversations):
     """
@@ -22,15 +22,18 @@ def summarize_conversations_with_llm(conversations):
             "overall_sentiment": "N/A"
         }
 
-    all_texts = [conv['conversation_text'] for conv in conversations if conv['conversation_text']]
+    # Ensure we only process conversations that have text
+    all_texts = [conv['conversation_text'] for conv in conversations if conv.get('conversation_text')]
     if not all_texts:
         return {
-            "summary": "No conversation text available.",
+            "summary": "No conversation text available for summarization.",
             "issues": [],
             "overall_sentiment": "N/A"
         }
 
-    conversations_for_llm = "\n---\n".join(all_texts[:5]) # Limit to 5 for summarization context
+    # Limit the number of conversations sent to the LLM for summarization context
+    # This helps manage token limits and focuses the summary.
+    conversations_for_llm = "\n---\n".join(all_texts[:5])
 
     prompt_template = ChatPromptTemplate.from_messages(
         [
@@ -55,19 +58,19 @@ def summarize_conversations_with_llm(conversations):
         ]
     )
 
-    llm_chain = prompt_template | LLM | StrOutputParser()
+    llm_chain = prompt_template | GROQ_LLM | StrOutputParser()
 
     llm_response = "" # Initialize outside try block
     try:
         llm_response = llm_chain.invoke({"conversations": conversations_for_llm})
 
-        # --- MORE ROBUST JSON PARSING (Further enhanced) ---
+        # --- ROBUST JSON PARSING ---
         # 1. Strip leading/trailing whitespace
         json_string_candidate = llm_response.strip()
 
         # 2. Remove markdown code block fences if present (e.g., ```json ... ```)
         if json_string_candidate.startswith("```json") and json_string_candidate.endswith("```"):
-            json_string_candidate = json_string_candidate[7:-3].strip() # Remove "```json" and "```"
+            json_string_candidate = json_string_candidate[7:-3].strip()
 
         parsed_response = {} # Initialize parsed_response
 
@@ -87,7 +90,6 @@ def summarize_conversations_with_llm(conversations):
         if not parsed_response and json_string_candidate.startswith("{"):
             print("Attempting to fix incomplete JSON by appending '}'.")
             try:
-                # Add a closing brace and try again
                 parsed_response = json.loads(json_string_candidate + '}')
             except json.JSONDecodeError as e:
                 # Still failed, raise a more specific error
@@ -109,12 +111,14 @@ def summarize_conversations_with_llm(conversations):
         fallback_issues = {}
         fallback_sentiments = {'positive': 0, 'negative': 0, 'neutral': 0}
         for conv in conversations:
+            # These keys ('issue_category', 'sentiment') are expected due to mapping in bq_utils.py
             if conv.get('issue_category'):
                 fallback_issues[conv['issue_category']] = fallback_issues.get(conv['issue_category'], 0) + 1
             if conv.get('sentiment'):
+                # Ensure sentiment is lowercased for consistent counting
                 fallback_sentiments[conv['sentiment'].lower()] = fallback_sentiments.get(conv['sentiment'].lower(), 0) + 1
 
-        # Use more descriptive issue categories if available, otherwise default
+        # Determine overall sentiment based on counts
         identified_issues = list(fallback_issues.keys()) if fallback_issues else ["No specific issues identified"]
         overall_sentiment_fallback = "Mixed"
         if fallback_sentiments['positive'] > fallback_sentiments['negative'] and fallback_sentiments['positive'] > fallback_sentiments['neutral']:
@@ -123,6 +127,8 @@ def summarize_conversations_with_llm(conversations):
             overall_sentiment_fallback = "Negative"
         elif fallback_sentiments['neutral'] > 0 and fallback_sentiments['positive'] == 0 and fallback_sentiments['negative'] == 0:
             overall_sentiment_fallback = "Neutral"
+        elif fallback_sentiments['positive'] == 0 and fallback_sentiments['negative'] == 0 and fallback_sentiments['neutral'] == 0:
+            overall_sentiment_fallback = "N/A" # No sentiments found
 
         return {
             "summary": fallback_summary_text,
@@ -147,7 +153,8 @@ def answer_user_query_hybrid(user_query, faiss_index, all_conversations_indexed,
         end_date_str = today.strftime('%Y-%m-%d')
 
     print("Step 1: Filtering conversations using BigQuery (retrieving raw texts for subset)...")
-    bq_filtered_conversations = get_conversation_data( # Uses the raw data table
+    # get_conversation_data will now return all fields, mapped to expected keys
+    bq_filtered_conversations = get_conversation_data(
         zip_code=zip_code,
         start_date=start_date_str,
         end_date=end_date_str,
@@ -159,14 +166,20 @@ def answer_user_query_hybrid(user_query, faiss_index, all_conversations_indexed,
         return "No relevant conversations found based on your specified structured criteria."
 
     # Map conversation_id to its full data including embedding from our pre-indexed data
-    indexed_conversations_map = {conv['conversation_id']: conv for conv in all_conversations_indexed}
+    # This map is crucial for quickly retrieving the full conversation object (including embedding)
+    # after filtering by BigQuery.
+    indexed_conversations_map = {conv['conversation_id']: conv for conv in all_conversations_indexed if 'conversation_id' in conv}
 
     conversations_for_faiss_subset = []
     for conv_data_bq in bq_filtered_conversations:
         conv_id = conv_data_bq.get('conversation_id')
         if conv_id in indexed_conversations_map:
             # We found the conversation and its embedding in our pre-indexed data
-            conversations_for_faiss_subset.append(indexed_conversations_map[conv_id])
+            # Ensure the embedding is a numpy array for FAISS
+            conv_with_embedding = indexed_conversations_map[conv_id]
+            if isinstance(conv_with_embedding.get('embedding'), list):
+                conv_with_embedding['embedding'] = np.array(conv_with_embedding['embedding']).astype('float32')
+            conversations_for_faiss_subset.append(conv_with_embedding)
         else:
             print(f"Warning: Conversation ID {conv_id} from BigQuery filter not found in local FAISS index. Skipping.")
             # This can happen if BigQuery data is newer than the last index build.
@@ -176,7 +189,8 @@ def answer_user_query_hybrid(user_query, faiss_index, all_conversations_indexed,
         return "No conversations with available embeddings found within the BigQuery filtered set."
 
     # Prepare embeddings for a *temporary* FAISS index (for the filtered subset)
-    filtered_embeddings_array = np.array([conv['embedding'] for conv in conversations_for_faiss_subset]).astype('float32')
+    # This creates a new FAISS index only for the subset of conversations that passed BigQuery filters.
+    filtered_embeddings_array = np.array([conv['embedding'] for conv in conversations_for_faiss_subset if conv.get('embedding') is not None]).astype('float32')
 
     print(f" → Total {len(filtered_embeddings_array)} conversations with embeddings prepared for FAISS subset search.")
 
@@ -185,16 +199,20 @@ def answer_user_query_hybrid(user_query, faiss_index, all_conversations_indexed,
 
     print("Step 2: Building temporary FAISS index for filtered subset...")
     d = filtered_embeddings_array.shape[1]
-    temp_index = faiss.IndexFlatL2(d)
+    temp_index = faiss.IndexFlatL2(d) # Using L2 distance (Euclidean) for similarity search
     temp_index.add(filtered_embeddings_array)
     print(f" → Temporary FAISS index built with {temp_index.ntotal} vectors.")
 
     print("Step 3: Generating embedding for the user query...")
-    query_embedding = EMBEDDING_MODEL.encode([user_query], normalize_embeddings=True)[0].astype('float32')
+    # query_embedding = EMBEDDING_MODEL.encode([user_query], normalize_embeddings=True)[0].astype('float32')
+    query_embedding = np.array(EMBEDDING_MODEL.embed_query(user_query)).astype('float32')
     print(" → Query embedding generated.")
 
     print("Step 4: Performing FAISS vector similarity search on filtered results...")
-    k = 5 # Number of top similar conversations to retrieve
+    k = min(5, temp_index.ntotal) # Number of top similar conversations to retrieve, max 5 or total available
+    if k == 0:
+        return "Not enough conversations to perform a meaningful similarity search after filtering."
+
     D, I = temp_index.search(query_embedding.reshape(1, -1), k) # D are distances, I are indices
 
     # Map FAISS indices from the temporary index back to the conversations_for_faiss_subset
@@ -217,75 +235,23 @@ def answer_user_query_hybrid(user_query, faiss_index, all_conversations_indexed,
 
     return final_answer
 
-# --- GraphRAG Integration (Simulated) ---
+
+# --- GraphRAG Integration (Uses OPENAI_LLM) ---
 def query_knowledge_graph_agent(user_query: str) -> str:
     """
-    Simulates querying a GraphRAG-built knowledge graph for nuanced brand information,
+    Queries the GraphRAG-built knowledge graph for nuanced brand information,
     trends, product features, and competitive analysis.
     This function acts as the "Topic Agent" or "Trend Agent."
     """
     print(f"\n--- Processing User Query: '{user_query}' with Knowledge Graph Agent ---")
 
-    # --- SIMULATED GRAPH RETRIEVAL ---
-    retrieved_graph_context = ""
-    query_lower = user_query.lower()
-
-    # Ensure the brand_documents directory and dummy files exist
-    if not os.path.exists(BRAND_DOCUMENTS_DIR):
-        os.makedirs(BRAND_DOCUMENTS_DIR)
-        print(f"Created directory: '{BRAND_DOCUMENTS_DIR}'. Please place your brand documents here for GraphRAG.")
-        # Create dummy files for demonstration if they don't exist
-        dummy_brand_overview_path = os.path.join(BRAND_DOCUMENTS_DIR, "brand_overview.txt")
-        dummy_product_roadmap_path = os.path.join(BRAND_DOCUMENTS_DIR, "product_roadmap.txt")
-
-        if not os.path.exists(dummy_brand_overview_path):
-            with open(dummy_brand_overview_path, "w") as f:
-                f.write("InnovateTech is a leading AI solutions provider. Our core mission is to democratize AI. Our flagship product, 'AI-Assistant Pro', focuses on natural language understanding and automated customer support. A significant trend is the push for explainable AI. We aim to integrate more deeply with enterprise CRM systems.")
-            print(f"Created dummy file: {dummy_brand_overview_path}")
-        if not os.path.exists(dummy_product_roadmap_path):
-            with open(dummy_product_roadmap_path, "w") as f:
-                f.write("The roadmap for AI-Assistant Pro includes enhancements for real-time sentiment analysis and predictive issue detection. We are exploring partnerships with major cloud providers. The market shows a strong trend towards customized AI agents for specific industries. Our competitor, 'Global AI Solutions', recently launched a similar product, but ours offers superior scalability.")
-            print(f"Created dummy file: {dummy_product_roadmap_path}")
-        print("Dummy brand documents ensured for demonstration purposes.")
-
-
-    if "trend" in query_lower or "trends" in query_lower or "emerging patterns" in query_lower or "future" in query_lower:
-        retrieved_graph_context = (
-            "A significant trend observed is the push for explainable AI. "
-            "Another strong trend is towards customized AI agents for specific industries. "
-            "Future developments for AI-Assistant Pro include enhancements for real-time sentiment analysis and predictive issue detection. "
-            "We are exploring partnerships with major cloud providers."
-        )
-    elif "brand" in query_lower or "innovatetech" in query_lower or "mission" in query_lower:
-        retrieved_graph_context = (
-            "InnovateTech is a leading AI solutions provider. "
-            "Our core mission is to democratize AI. "
-            "Our flagship product is 'AI-Assistant Pro'."
-        )
-    elif "product" in query_lower or "features" in query_lower or "ai-assistant pro" in query_lower:
-        retrieved_graph_context = (
-            "'AI-Assistant Pro' focuses on natural language understanding and automated customer support. "
-            "Planned enhancements include real-time sentiment analysis and predictive issue detection. "
-            "It aims to integrate more deeply with enterprise CRM systems."
-        )
-    elif "competitor" in query_lower or "compare" in query_lower or "global ai solutions" in query_lower:
-        retrieved_graph_context = (
-            "Our competitor is 'Global AI Solutions'. They recently launched a similar product, "
-            "but AI-Assistant Pro offers superior scalability."
-        )
-    else:
-        retrieved_graph_context = (
-            "The brand is InnovateTech, a leading AI solutions provider whose mission is to democratize AI. "
-            "Its flagship product is AI-Assistant Pro, focusing on natural language understanding and automated customer support. "
-            "Key trends include explainable AI and customized AI agents. "
-            "Future plans involve real-time sentiment analysis and predictive issue detection. "
-            "Global AI Solutions is a competitor, but InnovateTech's product offers superior scalability."
-        )
+    # Call the actual GraphRAG utility function, passing the OPENAI_LLM
+    retrieved_graph_context = query_graphrag(user_query, openai_llm=OPENAI_LLM) # Pass the specific LLM
 
     if not retrieved_graph_context:
         return "I could not find relevant information in the knowledge graph for your query."
 
-    print(f" → Simulated GraphRAG Context Provided to LLM:\n{retrieved_graph_context[:300]}...")
+    print(f" → GraphRAG Context Provided to LLM:\n{retrieved_graph_context[:500]}...")
 
     prompt_template = ChatPromptTemplate.from_messages(
         [
@@ -302,7 +268,7 @@ def query_knowledge_graph_agent(user_query: str) -> str:
         ]
     )
 
-    llm_chain = prompt_template | LLM | StrOutputParser()
+    llm_chain = prompt_template | OPENAI_LLM | StrOutputParser() # Use OPENAI_LLM here
 
     try:
         final_answer = llm_chain.invoke({"user_query": user_query, "context": retrieved_graph_context})
@@ -312,7 +278,8 @@ def query_knowledge_graph_agent(user_query: str) -> str:
         print(f"Error during LLM call for knowledge graph query: {e}")
         return "Sorry, I could not synthesize an answer from the knowledge graph at this time."
 
-# --- Intent Classification LLM Setup ---
+
+# --- Intent Classification LLM Setup (Uses GROQ_LLM) ---
 intent_classification_prompt = ChatPromptTemplate.from_messages(
     [
         (
@@ -334,35 +301,35 @@ intent_classification_prompt = ChatPromptTemplate.from_messages(
             Example Outputs:
             1. User: "Summarize conversations for the last 7 days in zip code 12345 with negative sentiment."
                 {{
-                   "intent": "customer_conversation",
-                   "parameters": {{
-                     "zip_code": "12345",
-                     "days_back": 7,
-                     "sentiment": "negative"
-                   }}
+                    "intent": "customer_conversation",
+                    "parameters": {{
+                        "zip_code": "12345",
+                        "days_back": 7,
+                        "sentiment": "negative"
+                    }}
                 }}
             2. User: "What are the top trends for InnovateTech?"
                 {{
-                   "intent": "brand_knowledge",
-                   "parameters": {{}}
+                    "intent": "brand_knowledge",
+                    "parameters": {{}}
                 }}
             3. User: "Tell me about their new AI features."
                 {{
-                   "intent": "brand_knowledge",
-                   "parameters": {{}}
+                    "intent": "brand_knowledge",
+                    "parameters": {{}}
                 }}
             4. User: "How are customers feeling about internet speed issues in 90210?"
                 {{
-                   "intent": "customer_conversation",
-                   "parameters": {{
-                     "zip_code": "90210",
-                     "issue_category": "internet speed"
-                   }}
+                    "intent": "customer_conversation",
+                    "parameters": {{
+                        "zip_code": "90210",
+                        "issue_category": "internet speed"
+                    }}
                 }}
             5. User: "Hello, how are you?"
                 {{
-                   "intent": "unclear",
-                   "parameters": {{}}
+                    "intent": "unclear",
+                    "parameters": {{}}
                 }}
 
             YOUR ENTIRE RESPONSE MUST BE ONLY THE JSON OBJECT, NOTHING ELSE. DO NOT INCLUDE ANY INTRODUCTORY OR CONCLUDING REMARKS, OR MARKDOWN BACKTICKS (```json).
@@ -372,10 +339,10 @@ intent_classification_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
-intent_classification_chain = intent_classification_prompt | LLM | StrOutputParser()
+intent_classification_chain = intent_classification_prompt | OPENAI_LLM | StrOutputParser() # Use GROQ_LLM here
 
 
-# --- Main Chatbot Agent ---
+# --- Main Chatbot Agent (No Change in logic, only updated imports/initialization) ---
 def chatbot_main_agent(user_query: str, faiss_index: faiss.Index, all_conversations_indexed: list) -> str:
     """
     The main entry point for the chatbot. It uses an LLM to determine the user's intent
@@ -385,7 +352,6 @@ def chatbot_main_agent(user_query: str, faiss_index: faiss.Index, all_conversati
     print(f"\n--- Chatbot Main Agent Processing Query: '{user_query}' ---")
 
     try:
-        # Step 1: Use LLM for Intent Classification and Parameter Extraction
         print("Step 1: Classifying intent and extracting parameters using LLM...")
         llm_routing_response = intent_classification_chain.invoke({"user_query": user_query})
 
@@ -396,32 +362,21 @@ def chatbot_main_agent(user_query: str, faiss_index: faiss.Index, all_conversati
 
         json_string = llm_routing_response
 
-        # try:
-        #     # Robust JSON parsing for intent classification
-        #     json_string_candidate = json_string.strip()
-        #     if json_string_candidate.startswith("```json") and json_string_candidate.endswith("```"):
-        #         json_string_candidate = json_string_candidate[7:-3].strip() # Remove markdown code block
-        #     parsed_routing = json.loads(json_string_candidate)
-        # except json.JSONDecodeError as e:
-        #     print(f"Error decoding JSON from LLM intent: {e}. Raw: {json_string}")
-        #     parsed_routing = {"intent": "unclear", "parameters": {}}
-        print("This is json_string", json_string)
         parsed_routing = json.loads(json_string)
         print("This is parsed_routing", parsed_routing)
-        
+
 
         intent = parsed_routing.get("intent", "unclear")
         params = parsed_routing.get("parameters", {})
 
         print(f" → Detected Intent: '{intent}', Parameters: {params}")
 
-        # Step 2: Route based on detected intent
         if intent == "customer_conversation":
             print("--- Routing to Customer Conversation Agent ---")
-            # Pass the loaded FAISS index and conversation data to the agent
             return answer_user_query_hybrid(user_query, faiss_index, all_conversations_indexed, **params)
         elif intent == "brand_knowledge":
             print("--- Routing to Knowledge Graph (Brand/Trend) Agent ---")
+            # The query_knowledge_graph_agent function itself handles which LLM to use internally
             return query_knowledge_graph_agent(user_query)
         else:
             print("--- Intent Unclear ---")

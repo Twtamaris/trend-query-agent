@@ -1,125 +1,114 @@
+
+
+# faiss_utils.py
+
 import os
 import json
 import numpy as np
 import faiss
-from datetime import datetime
+from datetime import datetime, date # Ensure datetime and date are imported
 from bq_utils import get_conversation_data
 from models import EMBEDDING_MODEL
-from config import FAISS_INDEX_PATH, METADATA_PATH
+from config import FAISS_INDEX_PATH, METADATA_PATH, FAISS_INDEX_DIR
+
+# --- Custom JSON Encoder for robustness ---
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat() # Convert datetime/date objects to ISO 8601 strings
+        if isinstance(obj, (np.integer, np.floating)):
+            return obj.item() # Convert numpy integers/floats to standard Python int/float
+        if isinstance(obj, np.ndarray):
+            return obj.tolist() # Convert numpy arrays to Python lists
+        # Handle decimal.Decimal if it somehow appears (e.g., from BIGNUMERIC in BQ)
+        if isinstance(obj, float) and obj != obj: # Check for NaN (Not a Number) floats
+            return None # JSON doesn't support NaN, serialize as null
+        if isinstance(obj, (float, int)) and (obj == float('inf') or obj == float('-inf')): # Check for inf
+            return None # JSON doesn't support inf, serialize as null
+
+        return super().default(obj)
 
 def load_or_build_faiss_index():
-    """
-    Loads FAISS index and its corresponding metadata from disk.
-    If not found, or if new data exists in BigQuery, it builds/updates the index
-    with embeddings for all conversations and saves it.
-    Returns the FAISS index and the list of conversation data used to build it.
-    """
-    faiss_index = None
-    all_conversations_indexed = [] # This list will hold the actual conversation data, in the order of the FAISS index
+    if not os.path.exists(FAISS_INDEX_DIR):
+        os.makedirs(FAISS_INDEX_DIR)
+        print(f"Created FAISS index directory: '{FAISS_INDEX_DIR}'.")
 
-    # Try to load existing index and metadata
+    faiss_index = None
+    all_conversations_indexed = [] # This will hold data read from metadata.json
+
     if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(METADATA_PATH):
         try:
-            print("Attempting to load existing FAISS index and metadata...")
+            print(f"Attempting to load FAISS index from {FAISS_INDEX_PATH} and metadata from {METADATA_PATH}...")
             faiss_index = faiss.read_index(FAISS_INDEX_PATH)
             with open(METADATA_PATH, 'r') as f:
-                all_conversations_indexed = json.load(f)
-                # Convert embeddings back to numpy array on load
-                for conv in all_conversations_indexed:
-                    if 'embedding' in conv and isinstance(conv['embedding'], list):
-                        conv['embedding'] = np.array(conv['embedding']).astype('float32')
-                    # Optionally convert timestamp string back to datetime if needed for other ops
-                    if 'timestamp' in conv and isinstance(conv['timestamp'], str):
-                        try:
-                            conv['timestamp'] = datetime.fromisoformat(conv['timestamp'])
-                        except ValueError:
-                            pass # Keep as string if parsing fails
-
-            print(f"Loaded FAISS index with {faiss_index.ntotal} vectors.")
-            print(f"Loaded metadata for {len(all_conversations_indexed)} conversations.")
-
+                all_conversations_indexed = json.load(f) # No custom decoder needed for loading simple types
+            print("FAISS index and metadata loaded successfully.")
         except Exception as e:
-            print(f"Error loading FAISS index or metadata: {e}. Rebuilding index.")
+            print(f"Error loading existing FAISS index or metadata: {e}. Rebuilding...")
             faiss_index = None
-            all_conversations_indexed = []
+            all_conversations_indexed = [] # Reset to rebuild
 
-    # If no index loaded or an error occurred, proceed to build/update
     print("Fetching all conversations from BigQuery for indexing check...")
-    # Fetch all conversations to ensure we catch any new ones
     bq_all_conversations = get_conversation_data()
 
-    current_indexed_ids = {conv['conversation_id'] for conv in all_conversations_indexed if 'conversation_id' in conv}
+    # Create a map for quick lookup of existing conversations from BQ by ID
+    bq_conversations_map = {conv['conversation_id']: conv for conv in bq_all_conversations if conv.get('conversation_id')}
 
     new_conversations_to_embed = []
+    updated_conversations_for_metadata = [] # This list will be the source for the new metadata.json
     
-    # Identify new conversations or conversat   ions with no text/ID
-    for conv_data in bq_all_conversations:
-        conv_id = conv_data.get('conversation_id')
-        conv_text = conv_data.get('conversation_text')
-
-        if conv_id not in current_indexed_ids and conv_text:
-            new_conversations_to_embed.append(conv_data)
-        elif conv_id in current_indexed_ids:
-            # If it's already indexed, ensure it has its embedding for the final_embeddings_array
-            # For simplicity, we assume if it's in all_conversations_indexed, its embedding is valid.
-            pass # We will reconstruct `all_conversations_indexed` in next step
-        else:
-            print(f"Warning: Conversation {conv_id if conv_id else 'N/A'} has no text or ID. Skipping for indexing.")
-
-    if new_conversations_to_embed:
-        print(f"Identified {len(new_conversations_to_embed)} new conversations for embedding.")
-        new_texts = [conv['conversation_text'] for conv in new_conversations_to_embed]
-        print("Generating embeddings for new conversations...")
-        new_embeddings = EMBEDDING_MODEL.encode(new_texts, normalize_embeddings=True)
-
-        for i, conv_data in enumerate(new_conversations_to_embed):
-            conv_data['embedding'] = new_embeddings[i].tolist() # Store as list for JSON serialization
-            all_conversations_indexed.append(conv_data)
-
-        print(f"Added {len(new_conversations_to_embed)} new embeddings to the data list.")
-    else:
-        print("No new conversations found in BigQuery to add to the index.")
-
-    # Reconstruct the full list of data to be indexed, ensuring it contains all necessary fields
-    # This implicitly removes any old conversations not present in bq_all_conversations anymore
-    bq_conversations_map = {conv['conversation_id']: conv for conv in bq_all_conversations}
-
-    final_conversations_for_indexing = []
-    # Merge existing indexed data with new BigQuery data
-    # Iterate over `all_conversations_indexed` first to preserve order/existing embeddings
+    # Process existing indexed conversations (from file)
     for conv_data in all_conversations_indexed:
         conv_id = conv_data.get('conversation_id')
-        if conv_id in bq_conversations_map:
-            # Prefer the latest text and metadata from BQ, but keep the existing embedding if available
-            merged_conv_data = bq_conversations_map[conv_id]
-            # Ensure the embedding from our local cache is used
-            merged_conv_data['embedding'] = conv_data['embedding']
-            final_conversations_for_indexing.append(merged_conv_data)
-            del bq_conversations_map[conv_id] # Remove from map so we only process truly new ones
+        if conv_id and conv_id in bq_conversations_map:
+            # If conversation exists in both, use the BQ version for updated data
+            # but preserve the embedding from the loaded file if it exists
+            bq_version = bq_conversations_map[conv_id]
+            if 'embedding' in conv_data and conv_data['embedding'] is not None:
+                bq_version['embedding'] = conv_data['embedding']
+            updated_conversations_for_metadata.append(bq_version)
+            del bq_conversations_map[conv_id] # Mark as processed
+        # If conversation was in metadata but not in current BQ pull, we might omit it
+        # or include it if you want to retain old data. For now, we omit.
 
-    # Add any remaining (truly new) conversations from BigQuery that weren't in all_conversations_indexed initially
+    # Add remaining new conversations from BQ (those not yet processed)
     for conv_id in bq_conversations_map:
         conv_data = bq_conversations_map[conv_id]
-        if 'embedding' not in conv_data and conv_data.get('conversation_text'): # If it's a new one not yet embedded
-            print(f"Warning: Conversation {conv_id} from BQ was not pre-embedded. Embedding now.")
-            conv_data['embedding'] = EMBEDDING_MODEL.encode([conv_data['conversation_text']], normalize_embeddings=True)[0].tolist()
-        if 'embedding' in conv_data: # Only add if it now has an embedding
-            final_conversations_for_indexing.append(conv_data)
+        if conv_data.get('conversation_text'): # Only process if content exists
+            # Embed new conversations
+            if 'embedding' not in conv_data or conv_data['embedding'] is None:
+                print(f"Embedding new conversation: {conv_id}")
+                try:
+                    # Ensure the text is a string before embedding
+                    text_to_embed = str(conv_data['conversation_text'])
+                    embedding = EMBEDDING_MODEL.encode([text_to_embed], normalize_embeddings=True)[0].tolist()
+                    conv_data['embedding'] = embedding
+                except Exception as e:
+                    print(f"Error embedding conversation {conv_id}: {e}")
+                    conv_data['embedding'] = None # Mark as None if embedding fails
+            
+            # Only add to list if embedding was successful
+            if conv_data['embedding'] is not None:
+                new_conversations_to_embed.append(conv_data)
+                updated_conversations_for_metadata.append(conv_data)
 
-    # Filter out any conversations that ended up without an embedding
-    final_conversations_for_indexing = [conv for conv in final_conversations_for_indexing if conv.get('embedding') is not None]
+    # Filter out any conversations that might have failed to embed or lack text
+    final_conversations_for_indexing = [
+        conv for conv in updated_conversations_for_metadata
+        if conv.get('embedding') is not None and conv.get('conversation_text') is not None
+    ]
 
     if not final_conversations_for_indexing:
         print("No valid conversations with embeddings to build a FAISS index. Returning empty index.")
         return None, []
 
-    # Prepare embeddings for FAISS
     embeddings_for_faiss = np.array([
         np.array(conv['embedding']).astype('float32') for conv in final_conversations_for_indexing
     ])
 
+    # Rebuild FAISS index if necessary (new conversations, or index not loaded)
     if faiss_index is None or faiss_index.ntotal != embeddings_for_faiss.shape[0]:
-        print("Rebuilding FAISS index from scratch due to changes or initial build.")
+        print(f"Rebuilding FAISS index from scratch. Old size: {faiss_index.ntotal if faiss_index else 0}, New size: {embeddings_for_faiss.shape[0]}.")
         d = embeddings_for_faiss.shape[1]
         faiss_index = faiss.IndexFlatL2(d)
         faiss_index.add(embeddings_for_faiss)
@@ -129,19 +118,17 @@ def load_or_build_faiss_index():
     # Save updated index and metadata
     try:
         faiss.write_index(faiss_index, FAISS_INDEX_PATH)
-        serializable_conversations = []
-        for conv in final_conversations_for_indexing:
-            serializable_conv = conv.copy()
-            if 'embedding' in serializable_conv and isinstance(serializable_conv['embedding'], np.ndarray):
-                serializable_conv['embedding'] = serializable_conv['embedding'].tolist()
-            if 'timestamp' in serializable_conv and isinstance(serializable_conv['timestamp'], datetime):
-                serializable_conv['timestamp'] = serializable_conv['timestamp'].isoformat()
-            serializable_conversations.append(serializable_conv)
-
+        
+        # Use the custom encoder when dumping JSON
         with open(METADATA_PATH, 'w') as f:
-            json.dump(serializable_conversations, f)
+            json.dump(updated_conversations_for_metadata, f, indent=2, cls=CustomJSONEncoder)
         print(f"FAISS index and metadata saved to {FAISS_INDEX_PATH} and {METADATA_PATH}.")
     except Exception as e:
         print(f"Error saving FAISS index or metadata: {e}")
+        # Clean up potentially corrupted files
+        if os.path.exists(FAISS_INDEX_PATH):
+            os.remove(FAISS_INDEX_PATH)
+        if os.path.exists(METADATA_PATH):
+            os.remove(METADATA_PATH)
 
     return faiss_index, final_conversations_for_indexing
